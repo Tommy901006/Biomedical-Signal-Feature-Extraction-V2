@@ -9,12 +9,13 @@ from NLIDOOP3 import RecurrenceAnalysis
 class NLIDApp:
     def __init__(self, master):
         self.master = master
-        master.title("NLID 批次分析工具（支援參數輸入）")
-        master.geometry("800x600")
+        master.title("NLID 批次分析工具（支援參數輸入與滑動窗口）")
+        master.geometry("900x650")
 
         container = ttk.Frame(master, padding=10)
         container.pack(fill='both', expand=True)
 
+        # Input settings
         input_frame = ttk.Labelframe(container, text="Input Settings", padding=10)
         input_frame.pack(fill='x', pady=5)
 
@@ -22,20 +23,20 @@ class NLIDApp:
         self.entry_folder = ttk.Entry(input_frame, width=60)
         self.entry_folder.grid(row=0, column=1, sticky='ew')
         ttk.Button(input_frame, text="Browse", command=self.browse_folder).grid(row=0, column=2)
-
         ttk.Button(input_frame, text="Load Columns", command=self.load_columns).grid(row=1, column=1, pady=5)
-
         input_frame.columnconfigure(1, weight=1)
 
+        # Column selection
         column_frame = ttk.Labelframe(container, text="Select 2 Columns", padding=10)
         column_frame.pack(fill='x', pady=5)
-        self.combo_col_x = ttk.Combobox(column_frame, state="readonly", width=30)
-        self.combo_col_y = ttk.Combobox(column_frame, state="readonly", width=30)
         ttk.Label(column_frame, text="Column X:").grid(row=0, column=0, sticky='e')
-        self.combo_col_x.grid(row=0, column=1, sticky='w', padx=5, pady=2)
+        self.combo_col_x = ttk.Combobox(column_frame, state="readonly", width=30)
+        self.combo_col_x.grid(row=0, column=1, sticky='w', padx=5)
         ttk.Label(column_frame, text="Column Y:").grid(row=1, column=0, sticky='e')
-        self.combo_col_y.grid(row=1, column=1, sticky='w', padx=5, pady=2)
+        self.combo_col_y = ttk.Combobox(column_frame, state="readonly", width=30)
+        self.combo_col_y.grid(row=1, column=1, sticky='w', padx=5)
 
+        # Parameters
         param_frame = ttk.Labelframe(container, text="Parameters", padding=10)
         param_frame.pack(fill='x', pady=5)
         ttk.Label(param_frame, text="Embedding dimension (m):").grid(row=0, column=0, sticky='w')
@@ -46,13 +47,20 @@ class NLIDApp:
         self.entry_tau = ttk.Entry(param_frame, width=10)
         self.entry_tau.insert(0, "1")
         self.entry_tau.grid(row=1, column=1, sticky='w', padx=5)
+        ttk.Label(param_frame, text="Window size:").grid(row=2, column=0, sticky='w')
+        self.entry_window = ttk.Entry(param_frame, width=10)
+        self.entry_window.insert(0, "100")
+        self.entry_window.grid(row=2, column=1, sticky='w', padx=5)
+        ttk.Label(param_frame, text="Overlap ratio (0-1):").grid(row=3, column=0, sticky='w')
+        self.entry_overlap = ttk.Entry(param_frame, width=10)
+        self.entry_overlap.insert(0, "0.5")
+        self.entry_overlap.grid(row=3, column=1, sticky='w', padx=5)
 
-        progress_frame = ttk.Frame(container, padding=0)
+        # Progress and log
+        progress_frame = ttk.Frame(container)
         progress_frame.pack(fill='both', expand=True, pady=5)
-
         self.progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate")
         self.progress.pack(fill='x', pady=5)
-
         self.log = scrolledtext.ScrolledText(progress_frame, height=15, wrap='word')
         self.log.pack(fill='both', expand=True)
 
@@ -83,8 +91,6 @@ class NLIDApp:
             cols = [''] + list(df.columns.str.strip())
             self.combo_col_x['values'] = cols
             self.combo_col_y['values'] = cols
-            self.combo_col_x.set('')
-            self.combo_col_y.set('')
             messagebox.showinfo("Columns Loaded", f"Loaded columns from {files[0]}")
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
@@ -100,16 +106,21 @@ class NLIDApp:
         try:
             m = int(self.entry_m.get())
             tau = int(self.entry_tau.get())
+            window_size = int(self.entry_window.get())
+            overlap = float(self.entry_overlap.get())
         except ValueError:
-            messagebox.showerror("Invalid input", "m and tau must be integers.")
+            messagebox.showerror("Invalid input", "m, tau, window size must be integers and overlap a float.")
             return
         if not os.path.isdir(folder) or not col_x or not col_y:
             messagebox.showerror("Missing info", "Ensure folder and two columns are selected.")
             return
-        threading.Thread(target=self.process_files, args=(folder, col_x, col_y, m, tau), daemon=True).start()
+        if window_size <= 0 or not (0 <= overlap < 1):
+            messagebox.showerror("Invalid window settings", "Window size must be >0 and 0<=overlap<1.")
+            return
+        threading.Thread(target=self.process_files, args=(folder, col_x, col_y, m, tau, window_size, overlap), daemon=True).start()
 
-    def process_files(self, folder, col_x, col_y, m, tau):
-        files = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(('.xlsx', '.csv'))]
+    def process_files(self, folder, col_x, col_y, m, tau, window_size, overlap):
+        files = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(('.xlsx', '.csv'))]
         self.progress['maximum'] = len(files)
         self.progress['value'] = 0
         results = []
@@ -119,47 +130,57 @@ class NLIDApp:
             try:
                 df = pd.read_excel(file) if file.endswith(('.xls', '.xlsx')) else pd.read_csv(file)
                 df.columns = df.columns.str.strip().str.upper()
-                col_x = col_x.strip().upper()
-                col_y = col_y.strip().upper()
+                cx = col_x.strip().upper()
+                cy = col_y.strip().upper()
 
-                if col_x not in df.columns or col_y not in df.columns:
+                if cx not in df.columns or cy not in df.columns:
                     self.log_message(f"{basename}: missing selected columns.")
                     continue
 
-                x = df[col_x].dropna().values
-                y = df[col_y].dropna().values
+                x = df[cx].dropna().values
+                y = df[cy].dropna().values
                 min_len = min(len(x), len(y))
-                if min_len < 1:
-                    self.log_message(f"{basename}: not enough data.")
+                if min_len < window_size:
+                    self.log_message(f"{basename}: data shorter than window size.")
                     continue
 
-                x = x[:min_len]
-                y = y[:min_len]
+                # Sliding window
+                step = int(window_size * (1 - overlap))
+                nlid_xy_list = []
+                nlid_yx_list = []
+                for start in range(0, min_len - window_size + 1, step):
+                    x_win = x[start:start + window_size]
+                    y_win = y[start:start + window_size]
 
-                ra_x = RecurrenceAnalysis(x, m=m, tau=tau)
-                ps_x = ra_x.reconstruct_phase_space()
+                    ra_x = RecurrenceAnalysis(x_win, m=m, tau=tau)
+                    ps_x = ra_x.reconstruct_phase_space()
+                    ra_y = RecurrenceAnalysis(y_win, m=m, tau=tau)
+                    ps_y = ra_y.reconstruct_phase_space()
 
-                ra_y = RecurrenceAnalysis(y, m=m, tau=tau)
-                ps_y = ra_y.reconstruct_phase_space()
+                    AR_X = RecurrenceAnalysis.compute_reconstruction_matrix(ps_x, threshold=0.1, threshold_type="dynamic")
+                    AR_Y = RecurrenceAnalysis.compute_reconstruction_matrix(ps_y, threshold=0.1, threshold_type="dynamic")
 
-                AR_X = RecurrenceAnalysis.compute_reconstruction_matrix(ps_x, threshold=0.1, threshold_type="dynamic")
-                AR_Y = RecurrenceAnalysis.compute_reconstruction_matrix(ps_y, threshold=0.1, threshold_type="dynamic")
+                    nlid_xy, nlid_yx = RecurrenceAnalysis.calculate_nlid(AR_X, AR_Y)
+                    nlid_xy_list.append(nlid_xy)
+                    nlid_yx_list.append(nlid_yx)
 
-                NLID_XY, NLID_YX = RecurrenceAnalysis.calculate_nlid(AR_X, AR_Y)
+                # Compute average NLID
+                avg_xy = np.mean(nlid_xy_list)
+                avg_yx = np.mean(nlid_yx_list)
 
                 results.append({
                     "檔名": basename,
-                    f"NLID({col_x}|{col_y})": NLID_XY,
-                    f"NLID({col_y}|{col_x})": NLID_YX
+                    f"Avg NLID({cx}|{cy})": avg_xy,
+                    f"Avg NLID({cy}|{cx})": avg_yx
                 })
-                self.log_message(f"Processed: {basename}")
+                self.log_message(f"Processed: {basename} (windows: {len(nlid_xy_list)})")
             except Exception as e:
                 self.log_message(f"Error {basename}: {e}")
             self.progress['value'] += 1
 
         if results:
             result_df = pd.DataFrame(results)
-            output_path = os.path.join(folder, "NLID_Results.xlsx")
+            output_path = os.path.join(folder, "NLID_Results_Avg.xlsx")
             result_df.to_excel(output_path, index=False)
             self.log_message(f"Results saved to {output_path}")
             messagebox.showinfo("Done", f"Analysis completed. Saved to: {output_path}")
